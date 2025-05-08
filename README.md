@@ -6,5 +6,5 @@
 * `./jacob --cpu` - запуск CPU
 * `./jacob --compare` - сравнение CPU и GPU
 * `./jacob -L 900 -i 10` -  изменение размера сетки и итераций
-
+* `./jacob -DUSE_FLOAT` - изменение типа данных на float
 
