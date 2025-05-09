@@ -8,9 +8,20 @@
 #endif
 
 #ifdef USE_FLOAT
-  typedef float real_t;
+typedef float real_t;
 #else
-  typedef double real_t;
+typedef double real_t;
+
+__device__ double atomicMaxDouble(double* addr, double val) {
+    unsigned long long* uaddr = (unsigned long long*)addr;
+    unsigned long long old = *uaddr, assumed;
+    do {
+        assumed = old;
+        if (__longlong_as_double(assumed) >= val) break;
+        old = atomicCAS(uaddr, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
 #endif
 
 int L       = 384;
@@ -47,17 +58,10 @@ void init_fields(real_t* A, real_t* B) {
 void cpu_jacobi(real_t* A, real_t* B, double &tsec) {
     auto t0 = std::chrono::high_resolution_clock::now();
     real_t eps, tol = (real_t)0.5;
-    for(int it=1; it<=ITER; ++it) {
-        eps = 0;
-        #pragma omp parallel for reduction(max:eps)
-        for(size_t idx=0; idx<(size_t)L*L*L; ++idx) {
-            int i = idx/(L*L), j = (idx/L)%L, k = idx%L;
-            if(i>0&&i<L-1&&j>0&&j<L-1&&k>0&&k<L-1) {
-                real_t d = fabs(B[idx] - A[idx]);
-                if (d>eps) eps = d;
-            }
-        }
+
+    for(int it = 1; it <= ITER; ++it) {
         real_t* tmp = A; A = B; B = tmp;
+
         #pragma omp parallel for
         for (size_t idx = 0; idx < (size_t)(L-2)*(L-2)*(L-2); ++idx) {
             int i = idx / ((L-2)*(L-2)) + 1;
@@ -65,34 +69,57 @@ void cpu_jacobi(real_t* A, real_t* B, double &tsec) {
             int k = idx % (L-2) + 1;
             size_t index = (size_t)i*L*L + j*L + k;
             B[index] = (A[index - L*L] + A[index - L] + A[index - 1] +
-                        A[index + 1] + A[index + L] + A[index + L*L]) / 6.0;
+                        A[index + 1] + A[index + L] + A[index + L*L]) / (real_t)6.0;
         }
+
+        eps = 0;
+        #pragma omp parallel for reduction(max:eps)
+        for (size_t idx = 0; idx < (size_t)L*L*L; ++idx) {
+            int i = idx/(L*L), j = (idx/L)%L, k = idx%L;
+            if (i>0 && i<L-1 && j>0 && j<L-1 && k>0 && k<L-1) {
+                real_t d = fabs(B[idx] - A[idx]);
+                if (d > eps) eps = d;
+            }
+        }
+
+        printf("CPU IT=%3d EPS=%e\n", it, eps);
         if (eps < tol) break;
     }
+
     auto t1 = std::chrono::high_resolution_clock::now();
     tsec = std::chrono::duration<double>(t1 - t0).count();
 }
 
-__global__ void jacobi_kernel(const real_t* A, real_t* B, int L) {
+__global__ void jacobi_kernel(const real_t* A, real_t* B, int L, real_t* d_eps) {
     size_t idx = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
     size_t N = (size_t)L*L*L;
     if (idx >= N) return;
     int i = idx/(L*L), rem = idx%(L*L);
     int j = rem/L, k = rem%L;
+
+    real_t A_val = A[idx];
+    real_t B_val;
     if(i>0&&i<L-1&&j>0&&j<L-1&&k>0&&k<L-1) {
-        B[idx] = (A[idx - L*L] + A[idx - L] + A[idx - 1]
-                + A[idx + 1]   + A[idx + L] + A[idx + L*L])
-               / (real_t)6.0;
+        B_val = (A[idx - L*L] + A[idx - L] + A[idx - 1]
+               + A[idx + 1]   + A[idx + L] + A[idx + L*L]) / (real_t)6.0;
+        real_t diff = fabs(B_val - A_val);
+        #ifdef USE_FLOAT
+            atomicMax(d_eps, diff);
+        #else
+            atomicMaxDouble(d_eps, diff);
+        #endif
     } else {
-        B[idx] = A[idx];
+        B_val = A_val;
     }
+    B[idx] = B_val;
 }
 
 void gpu_jacobi(real_t* A_h, real_t* B_h, double &tsec) {
     size_t Nbytes = sizeof(real_t)*(size_t)L*L*L;
-    real_t *A_d, *B_d;
+    real_t *A_d, *B_d, *d_eps;
     cudaMalloc(&A_d, Nbytes);
     cudaMalloc(&B_d, Nbytes);
+    cudaMalloc(&d_eps, sizeof(real_t));
     cudaMemcpy(A_d, A_h, Nbytes, cudaMemcpyHostToDevice);
     cudaMemcpy(B_d, B_h, Nbytes, cudaMemcpyHostToDevice);
 
@@ -103,10 +130,24 @@ void gpu_jacobi(real_t* A_h, real_t* B_h, double &tsec) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
-    for(int it=0; it<ITER; ++it) {
+
+    real_t tol = (real_t)0.5;
+    real_t eps = 0;
+    int it;
+    for(it=1; it<=ITER; ++it) {
+        cudaMemset(d_eps, 0, sizeof(real_t));
         real_t* tmp = A_d; A_d = B_d; B_d = tmp;
-        jacobi_kernel<<<blocks,threads>>>(A_d, B_d, L);
+
+        jacobi_kernel<<<blocks,threads>>>(A_d, B_d, L, d_eps);
+        cudaDeviceSynchronize();
+        
+        cudaMemcpy(&eps, d_eps, sizeof(real_t), cudaMemcpyDeviceToHost);
+        printf("GPU IT=%3d EPS=%e\n", it, eps);
+        
+
+        if (eps < tol) break;
     }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms; cudaEventElapsedTime(&ms, start, stop);
@@ -115,6 +156,7 @@ void gpu_jacobi(real_t* A_h, real_t* B_h, double &tsec) {
     cudaMemcpy(B_h, B_d, Nbytes, cudaMemcpyDeviceToHost);
     cudaFree(A_d);
     cudaFree(B_d);
+    cudaFree(d_eps);                                 // *** освобождаем
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 }
