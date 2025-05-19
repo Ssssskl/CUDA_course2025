@@ -62,15 +62,17 @@ void init_fields(real_t* A, real_t* B, int L){
     }
 }
 
-__global__ void jacobi_kernel(const real_t* A, real_t* B, int L, real_t* d_eps){
-    size_t idx = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
-    size_t N   = (size_t)L*L*L;
-    if(idx>=N) return;
-    int i = idx/(L*L), rem = idx%(L*L);
-    int j = rem/L, k = rem%L;
-    if(i>0&&i<L-1&&j>0&&j<L-1&&k>0&&k<L-1){
-        real_t v = (A[idx - L*L] + A[idx - L] + A[idx - 1]
-                  + A[idx + 1]   + A[idx + L] + A[idx + L*L])/(real_t)6.0;
+__global__ void jacobi_kernel(const real_t* A, real_t* B, int L, real_t* d_eps) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if(i>=L || j>=L || k>=L) return;
+
+    size_t idx = (size_t)i * L * L + j * L + k;
+    if (i>0 && i<L-1 && j>0 && j<L-1 && k>0 && k<L-1) {
+        real_t v = (A[idx - L * L] + A[idx - L] + A[idx - 1]
+                  + A[idx + 1] + A[idx + L] + A[idx + L * L]) / (real_t)6.0;
         B[idx] = v;
         real_t diff = fabs(v - A[idx]);
         #ifdef USE_FLOAT
@@ -83,13 +85,15 @@ __global__ void jacobi_kernel(const real_t* A, real_t* B, int L, real_t* d_eps){
     }
 }
 
-__global__ void compute_eps_kernel(const real_t* A, const real_t* B, int L, real_t* d_eps){
-    size_t idx = blockIdx.x*(size_t)blockDim.x + threadIdx.x;
-    size_t N   = (size_t)L*L*L;
-    if(idx>=N) return;
-    int i = idx/(L*L), rem = idx%(L*L);
-    int j = rem/L, k = rem%L;
-    if(i>0&&i<L-1&&j>0&&j<L-1&&k>0&&k<L-1){
+__global__ void compute_eps_kernel(const real_t* A, const real_t* B, int L, real_t* d_eps) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+
+    if(i>=L || j>=L || k>=L) return;
+
+    size_t idx = (size_t)i * L * L + j * L + k;
+    if (i>0 && i<L-1 && j>0 && j<L-1 && k>0 && k<L-1) {
         real_t diff = fabs(B[idx] - A[idx]);
         #ifdef USE_FLOAT
             atomicMaxFloat(d_eps, diff);
@@ -157,8 +161,8 @@ void gpu_jacobi(real_t* A_h, real_t* B_h, int L, int ITER, double &tsec){
     cudaMemcpy(A_d, A_h, Nbyt, cudaMemcpyHostToDevice);
     cudaMemcpy(B_d, B_h, Nbyt, cudaMemcpyHostToDevice);
 
-    int threads = 256;
-    int blocks  = (N + threads - 1)/threads;
+    dim3 threads(8,8,8); 
+    dim3 blocks((L + threads.x - 1)/threads.x, (L + threads.y - 1)/threads.y, (L + threads.z - 1)/threads.z);
     real_t eps;
 
     cudaMemset(d_eps, 0, sizeof(real_t));
